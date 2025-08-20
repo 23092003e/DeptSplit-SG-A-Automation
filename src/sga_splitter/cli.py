@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Annotated
 import sys
 
-import typer
+import typer # type: ignore
 from rich.console import Console
 
 from .core import split_workbook, split_workbook_multi_sheet, validate_inputs
@@ -220,22 +220,23 @@ def multi_sheet(
     ] = False,
 ) -> None:
     """
-    Split all sheets in a workbook with automatic sheet-specific processing:
+    Create separate Excel files - one for each Project/Department - with all 3 sheets included:
     - Sheet 1: Split by Project
     - Sheet 2 & 3: Split by Department
+    - Each output file contains all 3 sheets filtered for that specific Project/Department
     - Remove unwanted columns (Unnamed, Project/Department by default)
     - Preserve original formatting and layout
     
-    This mode automatically processes multi-sheet workbooks and applies the correct
-    splitting logic to each sheet while maintaining visual consistency.
+    Output: Creates multiple files like "Alpha - Multi Sheet.xlsx", "Beta - Multi Sheet.xlsx", etc.
+    Each file contains all 3 sheets with data filtered for that specific group.
     
     Examples:
     
-        # Process all sheets with default column removal
+        # Create files for each Project/Department with default settings
         sga-split multi-sheet --input "workbook.xlsx"
         
         # Custom output directory and column removal
-        sga-split multi-sheet --input "workbook.xlsx" --out ./MultiSheet_Results --remove-columns "unnamed,temp,notes"
+        sga-split multi-sheet --input "workbook.xlsx" --out ./Results --remove-columns "unnamed,temp,notes"
         
         # Include total rows and empty groups
         sga-split multi-sheet --input "workbook.xlsx" --keep-totals --include-empty
@@ -268,7 +269,7 @@ def multi_sheet(
         if result['manifest_entries']:
             print_manifest_table(result['manifest_entries'], console)
         
-        print_success_message(result['total_files_created'], result['output_dir'], console)
+        print_success_message(result['files_created'], result['output_dir'], console)
         
         # Additional output info
         manifest_path = Path(result['output_dir']) / "manifest.csv"
@@ -303,7 +304,8 @@ def _print_multi_sheet_summary(summary: dict, console: Console) -> None:
     # Add summary rows
     table.add_row("Input File", summary.get('input_file', 'Unknown'))
     table.add_row("Sheets Processed", str(len(summary.get('sheets_processed', []))))
-    table.add_row("Total Files Created", str(summary.get('total_files_created', 0)))
+    table.add_row("Total Groups", str(summary.get('total_groups', 0)))
+    table.add_row("Files Created", str(summary.get('files_created', 0)))
     table.add_row("Output Directory", summary.get('output_dir', 'Unknown'))
     
     console.print()
@@ -311,24 +313,16 @@ def _print_multi_sheet_summary(summary: dict, console: Console) -> None:
     
     # Create detailed sheet table
     if summary.get('sheets_processed'):
-        sheet_table = Table(title="Sheet Processing Details", show_header=True, header_style="bold green")
-        sheet_table.add_column("Sheet", style="cyan")
-        sheet_table.add_column("Split By", style="blue")
-        sheet_table.add_column("Column", style="yellow")
-        sheet_table.add_column("Groups", justify="right", style="magenta")
-        sheet_table.add_column("Files", justify="right", style="green")
+        sheet_table = Table(title="Sheets Included", show_header=True, header_style="bold green")
+        sheet_table.add_column("Sheet Name", style="cyan")
         
-        for sheet_info in summary['sheets_processed']:
-            sheet_table.add_row(
-                sheet_info.get('sheet_name', 'Unknown'),
-                sheet_info.get('split_by', 'Unknown'),
-                sheet_info.get('split_column', 'Unknown'),
-                str(sheet_info.get('groups_found', 0)),
-                str(sheet_info.get('files_created', 0))
-            )
+        for sheet_name in summary['sheets_processed']:
+            sheet_table.add_row(sheet_name)
         
         console.print()
         console.print(sheet_table)
+
+
 
 
 if __name__ == "__main__":

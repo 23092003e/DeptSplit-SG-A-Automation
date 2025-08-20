@@ -249,7 +249,7 @@ def split_workbook_multi_sheet(
     remove_columns: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Split all sheets in a workbook with specific criteria:
+    Process all three sheets in a workbook and create a single output file containing all sheets:
     - Sheet 1: Split by Project
     - Sheet 2 & 3: Split by Department
     - Remove specified columns from output
@@ -257,7 +257,7 @@ def split_workbook_multi_sheet(
     
     Args:
         input_path: Path to input Excel file
-        out_dir: Output directory for split files
+        out_dir: Output directory for the single output file
         skip_totals: Whether to skip rows containing 'total'
         case_insensitive: Whether group matching should be case insensitive
         include_empty: Whether to include groups that would be empty
@@ -266,7 +266,7 @@ def split_workbook_multi_sheet(
     Returns:
         Summary dictionary with results
     """
-    logger.info(f"Starting multi-sheet workbook split: {input_path}")
+    logger.info(f"Starting multi-sheet workbook processing: {input_path}")
     
     # Default columns to remove
     if remove_columns is None:
@@ -302,84 +302,100 @@ def split_workbook_multi_sheet(
         }
     ]
     
-    all_manifest_entries = []
-    summary_data = {
-        'input_file': str(input_path),
-        'sheets_processed': [],
-        'total_files_created': 0,
-        'output_dir': str(out_dir)
-    }
+    # First pass: Process all sheets and collect their data
+    processed_sheets = []
+    all_groups = set()
     
-    # Process each sheet
     for i, config in enumerate(sheet_configs):
         try:
             logger.info(f"Processing sheet {i+1}: '{config['sheet_name']}' - split by {config['split_by']}")
             
-            # Process this sheet
-            sheet_result = _process_single_sheet_multi_mode(
+            # Process this sheet and collect its information
+            sheet_data = _analyze_sheet_for_multi_processing(
                 wb=wb,
                 input_path=input_path,
                 sheet_config=config,
-                out_dir=out_dir,
                 skip_totals=skip_totals,
                 case_insensitive=case_insensitive,
                 include_empty=include_empty,
                 remove_columns=remove_columns
             )
             
-            all_manifest_entries.extend(sheet_result['manifest_entries'])
-            summary_data['sheets_processed'].append(sheet_result)
+            processed_sheets.append(sheet_data)
+            all_groups.update(sheet_data['groups'])
             
         except Exception as e:
             logger.error(f"Failed to process sheet '{config['sheet_name']}': {e}")
             continue
     
-    summary_data['total_files_created'] = len(all_manifest_entries)
-    summary_data['manifest_entries'] = all_manifest_entries
+    if not processed_sheets:
+        raise ValueError("No sheets could be processed")
     
-    # Write combined manifest
+    logger.info(f"Found {len(all_groups)} unique groups across all sheets: {list(all_groups)}")
+    
+    # Second pass: Create one file per group with all 3 sheets
+    from .exporters import create_multi_sheet_files_per_group
+    
+    manifest_entries = create_multi_sheet_files_per_group(
+        input_path=input_path,
+        groups=list(all_groups),
+        processed_sheets=processed_sheets,
+        out_dir=out_dir,
+        remove_columns=remove_columns
+    )
+    
+    # Write manifest
     manifest_path = out_dir / "manifest.csv"
-    if all_manifest_entries:
-        write_manifest_csv(all_manifest_entries, manifest_path)
-        logger.info(f"Wrote combined manifest to: {manifest_path}")
+    if manifest_entries:
+        write_manifest_csv(manifest_entries, manifest_path)
+        logger.info(f"Wrote manifest to: {manifest_path}")
     
     # Write HTML index
     index_path = out_dir / "index.html"
-    if all_manifest_entries:
-        write_html_index(all_manifest_entries, index_path, "Multi-Sheet SG&A Split Results")
+    if manifest_entries:
+        write_html_index(manifest_entries, index_path, "Multi-Sheet SG&A Split Results")
         logger.info(f"Wrote HTML index to: {index_path}")
     
     wb.close()
     
-    logger.info(f"Multi-sheet processing complete: {len(all_manifest_entries)} files created")
+    summary_data = {
+        'input_file': str(input_path),
+        'sheets_processed': [sheet['config']['sheet_name'] for sheet in processed_sheets],
+        'total_groups': len(all_groups),
+        'files_created': len(manifest_entries),
+        'output_dir': str(out_dir),
+        'manifest_entries': manifest_entries
+    }
+    
+    logger.info(f"Multi-sheet processing complete: {len(manifest_entries)} files created for {len(all_groups)} groups")
     return summary_data
 
 
-def _process_single_sheet_multi_mode(
+
+
+def _analyze_sheet_for_multi_processing(
     wb,
     input_path: Path,
     sheet_config: Dict[str, Any],
-    out_dir: Path,
     skip_totals: bool,
     case_insensitive: bool,
     include_empty: bool,
     remove_columns: List[str]
 ) -> Dict[str, Any]:
     """
-    Process a single sheet in multi-sheet mode.
+    Analyze a single sheet for multi-sheet processing - collects data without creating files.
     
     Args:
         wb: Loaded workbook
         input_path: Path to input file
         sheet_config: Configuration for this sheet
-        out_dir: Output directory
         skip_totals: Whether to skip total rows
         case_insensitive: Case insensitive matching
         include_empty: Include empty groups
         remove_columns: Columns to remove
         
     Returns:
-        Dictionary with processing results
+        Dictionary with sheet analysis data
     """
     sheet_name = sheet_config['sheet_name']
     split_by = sheet_config['split_by']
@@ -419,29 +435,14 @@ def _process_single_sheet_multi_mode(
     
     logger.info(f"Sheet '{sheet_name}': found {len(groups)} groups")
     
-    # Create sheet-specific output directory
-    sheet_out_dir = out_dir / f"Sheet_{sheet_name.replace(' ', '_')}"
-    ensure_out_dir(sheet_out_dir)
-    
-    # Export using clone mode with column removal
-    manifest_entries = export_clone_multi_sheet(
-        input_path=input_path,
-        groups=groups,
-        sheet_name=sheet_name,
-        header_row=header_row_idx,
-        split_col_idx=new_split_col_idx,
-        out_dir=sheet_out_dir,
-        remove_columns=remove_columns,
-        original_split_col_idx=split_col_idx
-    )
-    
     return {
-        'sheet_name': sheet_name,
-        'split_by': split_by,
-        'split_column': split_col_name,
-        'groups_found': len(groups),
-        'files_created': len(manifest_entries),
-        'manifest_entries': manifest_entries
+        'config': sheet_config,
+        'header_row': header_row_idx,
+        'split_col_idx': split_col_idx,
+        'split_col_name': split_col_name,
+        'new_split_col_idx': new_split_col_idx,
+        'groups': groups,
+        'df': df_cleaned
     }
 
 
@@ -460,6 +461,7 @@ def _detect_header_and_split_column(ws, column_patterns: List[str]):
     
     max_rows_to_scan = min(50, ws.max_row)
     
+    # Look for a proper header row - one that has multiple column headers
     for row_idx in range(max_rows_to_scan):
         row_values = []
         for col_idx in range(min(20, ws.max_column)):
@@ -467,21 +469,66 @@ def _detect_header_and_split_column(ws, column_patterns: List[str]):
             value = str(cell.value or "").strip()
             row_values.append(value)
         
-        # Check if any column header matches our patterns
-        for col_idx, header in enumerate(row_values):
-            if _matches_any_pattern(header, column_patterns):
-                return row_idx, col_idx
+        # Check if this looks like a header row (has multiple non-empty cells)
+        non_empty_count = sum(1 for val in row_values if val)
+        if non_empty_count >= 2:  # At least 2 columns with headers
+            # Find the best match for our patterns, preferring exact matches
+            best_match = None
+            best_score = 0
+            
+            for col_idx, header in enumerate(row_values):
+                if _matches_any_pattern(header, column_patterns):
+                    # Calculate match quality - prefer exact matches and shorter headers
+                    match_score = 0
+                    header_lower = header.lower()
+                    
+                    # Exact match gets highest score
+                    for pattern in column_patterns:
+                        if header_lower == pattern.lower():
+                            match_score = 100
+                            break
+                        elif header_lower.startswith(pattern.lower()) and '/' not in header_lower:
+                            match_score = 80  # High score for clean prefix matches
+                        elif header_lower.startswith(pattern.lower()):
+                            match_score = 40  # Lower score if prefix match but has separators
+                        elif header_lower.endswith(pattern.lower()) and '/' not in header_lower:
+                            match_score = 70  # Good score for clean suffix matches like "B_Project"
+                        elif pattern.lower() in header_lower and '/' not in header_lower:
+                            match_score = max(match_score, 60)  # Good score if no separators
+                        elif pattern.lower() in header_lower:
+                            match_score = max(match_score, 20)  # Low score if has separators
+                    
+                    # Heavily penalize compound headers like "Project/Department" that will be removed
+                    if '/' in header_lower or '_' in header_lower or 'department' in header_lower:
+                        match_score -= 50
+                    
+                    # Extra penalty if this column name appears in removal patterns
+                    for remove_pattern in ['project/department', 'department/project', 'unnamed']:
+                        if remove_pattern.lower() in header_lower:
+                            match_score -= 100
+                    
+                    # Prefer shorter headers (more specific)
+                    match_score += max(0, 20 - len(header))
+                    
+                    if match_score > best_score:
+                        best_score = match_score
+                        best_match = (row_idx, col_idx)
+            
+            if best_match and non_empty_count >= 3:
+                return best_match
     
     # If no specific pattern found, try the original detection
     from .detect import detect_header_and_column
     try:
         return detect_header_and_column(ws)
     except ValueError:
-        # If that fails, look for first non-empty row as header
+        # If that fails, look for first row with multiple columns that looks like a header
         for row_idx in range(max_rows_to_scan):
             row_values = [str(ws.cell(row=row_idx + 1, column=col_idx + 1).value or "").strip() 
                          for col_idx in range(min(10, ws.max_column))]
-            if any(row_values):
+            non_empty_count = sum(1 for val in row_values if val)
+            
+            if non_empty_count >= 3:  # At least 3 columns suggest a header row
                 # Find first column that looks like it could contain groups
                 for col_idx, header in enumerate(row_values):
                     if header and len(header) > 0:

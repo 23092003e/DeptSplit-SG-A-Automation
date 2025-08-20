@@ -7,7 +7,7 @@ from typing import List, Dict, Any
 import logging
 
 import pandas as pd
-import xlsxwriter
+import xlsxwriter #type: ignore
 import openpyxl
 from openpyxl.workbook import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
@@ -411,3 +411,426 @@ def _preserve_formatting(ws: Worksheet, header_row: int):
     except Exception as e:
         logger.warning(f"Could not fully preserve formatting: {e}")
         # Continue processing even if formatting fails
+
+
+
+def _write_dataframe_to_worksheet(df, ws):
+    """
+    Write DataFrame data to worksheet with proper formatting.
+    
+    Args:
+        df: DataFrame to write
+        ws: Worksheet to write to
+    """
+    # Write headers
+    for col_idx, column_name in enumerate(df.columns):
+        ws.cell(row=1, column=col_idx + 1, value=column_name)
+    
+    # Write data
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row):
+            ws.cell(row=row_idx, column=col_idx + 1, value=value)
+
+
+
+
+def _apply_basic_formatting(ws):
+    """
+    Apply basic formatting to the worksheet.
+    
+    Args:
+        ws: Worksheet to format
+    """
+    try:
+        from openpyxl.styles import Font, PatternFill
+        
+        # Format header row
+        header_font = Font(bold=True)
+        header_fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+        
+        for cell in ws[1]:  # First row
+            if cell.value:
+                cell.font = header_font
+                cell.fill = header_fill
+        
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            
+            for cell in column:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            
+            adjusted_width = min(max(max_length + 2, 10), 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+            
+        # Add autofilter
+        if ws.max_row > 1:
+            ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(ws.max_column)}{ws.max_row}"
+            
+    except Exception as e:
+        logger.warning(f"Could not apply basic formatting: {e}")
+
+
+def create_multi_sheet_files_per_group(
+    input_path: Path,
+    groups: List[str],
+    processed_sheets: List[Dict[str, Any]],
+    out_dir: Path,
+    remove_columns: List[str]
+) -> List[Dict[str, Any]]:
+    """
+    Create one Excel file per group, each containing all three sheets filtered for that group.
+    
+    Args:
+        input_path: Path to original input file
+        groups: List of unique groups across all sheets
+        processed_sheets: List of processed sheet data
+        out_dir: Output directory
+        remove_columns: Columns to remove
+        
+    Returns:
+        List of manifest entries for created files
+    """
+    logger.info(f"Creating {len(groups)} files - one per group with all 3 sheets")
+    
+    manifest_entries = []
+    
+    # Load original workbook for copying formatting
+    original_wb = openpyxl.load_workbook(input_path)
+    
+    try:
+        for group in groups:
+            logger.info(f"Creating file for group: {group}")
+            
+            # Create new workbook for this group
+            group_wb = openpyxl.Workbook()
+            group_wb.remove(group_wb.active)  # Remove default sheet
+            
+            sheets_created = []
+            total_rows = 0
+            
+            try:
+                for sheet_data in processed_sheets:
+                    sheet_name = sheet_data['config']['sheet_name']
+                    
+                    # Check if this group exists in this sheet
+                    if group not in sheet_data['groups']:
+                        logger.info(f"Group '{group}' not found in sheet '{sheet_name}' - creating empty filtered sheet")
+                    
+                    # Get original sheet for copying formatting
+                    original_ws = original_wb[sheet_name]
+                    
+                    # Create new sheet in group workbook
+                    new_ws = group_wb.create_sheet(sheet_name)
+                    
+                    # Copy sheet data filtered for this group
+                    rows_added = _copy_sheet_filtered_for_group(
+                        original_ws=original_ws,
+                        new_ws=new_ws,
+                        group=group,
+                        sheet_data=sheet_data,
+                        remove_columns=remove_columns
+                    )
+                    
+                    sheets_created.append(sheet_name)
+                    total_rows += rows_added
+                
+                # Generate filename and save
+                safe_group_name = sanitize_filename(group)
+                output_filename = f"{safe_group_name}_SG&A YTD Budget report.xlsx"
+                output_path = out_dir / output_filename
+                output_path = generate_unique_filename(output_path)
+                
+                group_wb.save(output_path)
+                logger.info(f"Created file for group '{group}': {output_path}")
+                
+                # Create manifest entry
+                manifest_entry = {
+                    'mode': 'multi_sheet_per_group',
+                    'Group': group,
+                    'output_path': str(output_path),
+                    'sheets_included': ', '.join(sheets_created),
+                    'total_rows': total_rows
+                }
+                manifest_entries.append(manifest_entry)
+                
+            finally:
+                group_wb.close()
+    
+    finally:
+        original_wb.close()
+    
+    return manifest_entries
+
+
+def _copy_sheet_filtered_for_group(
+    original_ws: Worksheet,
+    new_ws: Worksheet,
+    group: str,
+    sheet_data: Dict[str, Any],
+    remove_columns: List[str]
+) -> int:
+    # Get the columns to remove for this specific sheet
+    columns_to_remove = _identify_columns_to_remove(
+        original_ws, 
+        sheet_data['header_row'], 
+        remove_columns,
+        preserve_col_idx=sheet_data['split_col_idx']
+    )
+    
+    split_col_name = sheet_data['split_col_name']
+    df = sheet_data['df']
+    header_row_idx = sheet_data['header_row']
+    
+    # Filter data for this group
+    group_df = df[df[split_col_name] == group].copy() if group in df[split_col_name].values else pd.DataFrame()
+    
+    logger.info(f"Group '{group}' has {len(group_df)} rows in DataFrame")
+    
+    rows_added = 0
+    
+    # FIXED: Create proper mapping between original columns, cleaned DataFrame, and output
+    df_to_output_mapping = []
+    output_col_idx = 1
+    df_col_idx = 0  # Track position in cleaned DataFrame
+    
+    # Build header mapping to match DataFrame columns with original positions
+    header_row = header_row_idx + 1  # Convert to 1-based
+    original_headers = []
+    for col_idx in range(1, original_ws.max_column + 1):
+        header_cell = original_ws.cell(row=header_row, column=col_idx)
+        original_headers.append(str(header_cell.value or "").strip())
+    
+    # Create mapping for non-removed columns
+    for original_col_idx in range(1, original_ws.max_column + 1):
+        # Skip columns that should be removed
+        if (original_col_idx - 1) in columns_to_remove:
+            continue
+        
+        # Find corresponding column in cleaned DataFrame
+        original_header = original_headers[original_col_idx - 1]
+        
+        # Find matching column in DataFrame by header name
+        matching_df_col_idx = None
+        for i, df_col_name in enumerate(df.columns):
+            if str(df_col_name).strip() == original_header:
+                matching_df_col_idx = i
+                break
+        
+        # If exact match not found, use positional mapping
+        if matching_df_col_idx is None and df_col_idx < len(df.columns):
+            matching_df_col_idx = df_col_idx
+        
+        df_to_output_mapping.append({
+            'original_col': original_col_idx,
+            'output_col': output_col_idx,
+            'df_col_idx': matching_df_col_idx,
+            'original_header': original_header
+        })
+        
+        output_col_idx += 1
+        df_col_idx += 1
+    
+    # Rest of the function remains the same...
+    # Copy structure rows (everything up to and including header)
+    for row_idx in range(1, header_row_idx + 2):
+        for mapping in df_to_output_mapping:
+            original_col = mapping['original_col']
+            output_col = mapping['output_col']
+            
+            original_cell = original_ws.cell(row=row_idx, column=original_col)
+            new_cell = new_ws.cell(row=row_idx, column=output_col)
+            
+            new_cell.value = original_cell.value
+            _copy_cell_formatting(original_cell, new_cell)
+    
+    # Add filtered data rows with FIXED column mapping
+    if not group_df.empty:
+        data_start_row = header_row_idx + 2
+        
+        for df_row_idx, (_, row) in enumerate(group_df.iterrows()):
+            excel_row_idx = data_start_row + df_row_idx
+            
+            for mapping in df_to_output_mapping:
+                output_col = mapping['output_col']
+                df_col_idx = mapping['df_col_idx']
+                
+                # Get value from DataFrame using correct column index
+                if df_col_idx is not None and df_col_idx < len(df.columns):
+                    col_name = df.columns[df_col_idx]
+                    value = row.get(col_name, '')
+                else:
+                    value = ''
+                
+                new_cell = new_ws.cell(row=excel_row_idx, column=output_col)
+                new_cell.value = value
+                
+                # Copy formatting from template
+                original_data_row = header_row_idx + 2
+                if original_data_row <= original_ws.max_row:
+                    template_cell = original_ws.cell(row=original_data_row, column=mapping['original_col'])
+                    _copy_cell_formatting(template_cell, new_cell)
+            
+            rows_added += 1
+    
+    # Copy column widths
+    for mapping in df_to_output_mapping:
+        original_col = mapping['original_col']
+        output_col = mapping['output_col']
+        
+        original_letter = openpyxl.utils.get_column_letter(original_col)
+        output_letter = openpyxl.utils.get_column_letter(output_col)
+        
+        if original_letter in original_ws.column_dimensions:
+            new_ws.column_dimensions[output_letter].width = original_ws.column_dimensions[original_letter].width
+    
+    # Copy row heights for structure rows
+    for row_idx in range(1, header_row_idx + 2):
+        if row_idx in original_ws.row_dimensions:
+            new_ws.row_dimensions[row_idx].height = original_ws.row_dimensions[row_idx].height
+    
+    logger.info(f"Copied sheet '{new_ws.title}' for group '{group}' with {rows_added} data rows")
+    return rows_added
+
+
+def _copy_cell_formatting(original_cell, new_cell):
+    """Helper function to copy cell formatting safely."""
+    try:
+        if original_cell.font:
+            from openpyxl.styles import Font
+            new_cell.font = Font(
+                name=original_cell.font.name,
+                size=original_cell.font.size,
+                bold=original_cell.font.bold,
+                italic=original_cell.font.italic,
+                color=original_cell.font.color
+            )
+        if original_cell.fill:
+            from openpyxl.styles import PatternFill
+            if hasattr(original_cell.fill, 'patternType') and original_cell.fill.patternType:
+                new_cell.fill = PatternFill(
+                    patternType=original_cell.fill.patternType,
+                    start_color=original_cell.fill.start_color,
+                    end_color=original_cell.fill.end_color
+                )
+        if original_cell.border:
+            from openpyxl.styles import Border
+            new_cell.border = Border(
+                left=original_cell.border.left,
+                right=original_cell.border.right,
+                top=original_cell.border.top,
+                bottom=original_cell.border.bottom
+            )
+        if original_cell.alignment:
+            from openpyxl.styles import Alignment
+            new_cell.alignment = Alignment(
+                horizontal=original_cell.alignment.horizontal,
+                vertical=original_cell.alignment.vertical,
+                wrap_text=original_cell.alignment.wrap_text
+            )
+        if original_cell.number_format:
+            new_cell.number_format = original_cell.number_format
+    except Exception as e:
+        logger.debug(f"Could not copy formatting: {e}")
+
+
+def _copy_sheet_with_processed_data(
+    original_ws: Worksheet,
+    new_ws: Worksheet,
+    sheet_data: Dict[str, Any],
+    remove_columns: List[str]
+) -> None:
+    """
+    Copy original sheet structure with processed data (columns removed).
+    
+    Args:
+        original_ws: Original worksheet
+        new_ws: New worksheet to populate
+        sheet_data: Processed sheet data
+        remove_columns: Columns to remove
+    """
+    # Get the columns to remove for this specific sheet
+    columns_to_remove = _identify_columns_to_remove(
+        original_ws, 
+        sheet_data['header_row'], 
+        remove_columns,
+        preserve_col_idx=sheet_data['split_col_idx']
+    )
+    
+    # Copy rows from original, removing unwanted columns
+    for row_idx in range(1, original_ws.max_row + 1):
+        new_col_idx = 1
+        
+        for col_idx in range(1, original_ws.max_column + 1):
+            # Skip columns that should be removed
+            if (col_idx - 1) in columns_to_remove:
+                continue
+                
+            # Get original cell
+            original_cell = original_ws.cell(row=row_idx, column=col_idx)
+            
+            # Create new cell
+            new_cell = new_ws.cell(row=row_idx, column=new_col_idx)
+            
+            # Copy value and formatting
+            new_cell.value = original_cell.value
+            try:
+                if original_cell.font:
+                    from openpyxl.styles import Font
+                    new_cell.font = Font(
+                        name=original_cell.font.name,
+                        size=original_cell.font.size,
+                        bold=original_cell.font.bold,
+                        italic=original_cell.font.italic,
+                        color=original_cell.font.color
+                    )
+                if original_cell.fill:
+                    from openpyxl.styles import PatternFill
+                    if hasattr(original_cell.fill, 'patternType') and original_cell.fill.patternType:
+                        new_cell.fill = PatternFill(
+                            patternType=original_cell.fill.patternType,
+                            start_color=original_cell.fill.start_color,
+                            end_color=original_cell.fill.end_color
+                        )
+                if original_cell.border:
+                    from openpyxl.styles import Border
+                    new_cell.border = Border(
+                        left=original_cell.border.left,
+                        right=original_cell.border.right,
+                        top=original_cell.border.top,
+                        bottom=original_cell.border.bottom
+                    )
+                if original_cell.alignment:
+                    from openpyxl.styles import Alignment
+                    new_cell.alignment = Alignment(
+                        horizontal=original_cell.alignment.horizontal,
+                        vertical=original_cell.alignment.vertical,
+                        wrap_text=original_cell.alignment.wrap_text
+                    )
+                if original_cell.number_format:
+                    new_cell.number_format = original_cell.number_format
+            except Exception as e:
+                logger.debug(f"Could not copy formatting for cell {row_idx},{col_idx}: {e}")
+                
+            new_col_idx += 1
+    
+    # Copy column widths (adjust for removed columns)
+    new_col_idx = 1
+    for col_idx in range(1, original_ws.max_column + 1):
+        if (col_idx - 1) not in columns_to_remove:
+            col_letter = openpyxl.utils.get_column_letter(col_idx)
+            new_col_letter = openpyxl.utils.get_column_letter(new_col_idx)
+            
+            if col_letter in original_ws.column_dimensions:
+                new_ws.column_dimensions[new_col_letter].width = original_ws.column_dimensions[col_letter].width
+            
+            new_col_idx += 1
+    
+    # Copy row heights
+    for row_idx in range(1, original_ws.max_row + 1):
+        if row_idx in original_ws.row_dimensions:
+            new_ws.row_dimensions[row_idx].height = original_ws.row_dimensions[row_idx].height
+    
+    logger.info(f"Copied sheet data with {len(columns_to_remove)} columns removed")
